@@ -22,7 +22,7 @@ const SCORER_SYSTEM =
 const ASSIGNER_SYSTEM =
   "You are NuggetizeAssignerLLM, an intelligent assistant that can label a list of atomic nuggets based on if they are captured by a given passage.";
 
-export function buildNuggetCreatePrompt(query: string, context: string, maxNuggets: number): string {
+export function buildNuggetCreatePrompt(query: string, context: string, maxNuggets: number, initial: string[] = []): string {
   return [
     `Update the list of atomic nuggets of information (1-12 words), if needed, so they best provide the information required for the query. Leverage only the initial list of nuggets (if exists) and the provided context (this is an iterative process). Return only the final list of all nuggets in a Pythonic list format (even if no updates). Make sure there is no redundant information. Ensure the updated nugget list has at most ${maxNuggets} nuggets (can be less), keeping only the most vital ones. Order them in decreasing order of importance. Prefer nuggets that provide more interesting information.`,
     "",
@@ -30,8 +30,8 @@ export function buildNuggetCreatePrompt(query: string, context: string, maxNugge
     "Context:",
     context,
     `Search Query: ${query}`,
-    "Initial Nugget List: []",
-    "Initial Nugget List Length: 0",
+    `Initial Nugget List: ${JSON.stringify(initial)}`,
+    `Initial Nugget List Length: ${initial.length}`,
     "",
     'Only update the list of atomic nuggets (if needed, else return as is). Do not explain. Always answer in short nuggets (not questions). List in the form ["a", "b", ...].',
     "Updated Nugget List:",
@@ -105,17 +105,32 @@ async function askForList(llm: LlmClient, system: string, user: string, maxToken
   } catch { return null; }
 }
 
-/** Predict the nugget list for this narrative from our own retrieved evidence. */
+/**
+ * Predict the nugget list for this narrative from our own retrieved evidence.
+ *
+ * The creator prompt is explicitly iterative ("this is an iterative process") and takes the list built
+ * so far as input. Running it once over one batch under-generates badly: a single pass over 12 documents
+ * yielded 24 nuggets where the dev gold has 41 vital per topic at the median. So feed the documents in
+ * batches and carry the accumulated list into each pass, which is how the gold lists were built (their
+ * provenance is 1171 post-edit versus 84 original).
+ */
 export async function predictNuggets(
   llm: LlmClient,
   topic: TopicIdentity,
   docs: { docid: string; text: string }[],
-  opts: { maxNuggets: number; contextChars: number },
+  opts: { maxNuggets: number; contextChars: number; batchSize: number },
 ): Promise<string[]> {
-  const context = docs.map((d, i) => `[${i}] ${d.text.slice(0, opts.contextChars)}`).join("\n\n");
-  const list = await askForList(llm, CREATOR_SYSTEM, buildNuggetCreatePrompt(topic.narrative, context, opts.maxNuggets), 2000);
-  if (!list) return [];
-  return [...new Set(list.map((s) => s.trim()).filter((s) => s.length > 0))].slice(0, opts.maxNuggets);
+  let nuggets: string[] = [];
+  for (let start = 0; start < docs.length; start += opts.batchSize) {
+    const batch = docs.slice(start, start + opts.batchSize);
+    if (batch.length === 0) break;
+    const context = batch.map((d, i) => `[${i}] ${d.text.slice(0, opts.contextChars)}`).join("\n\n");
+    const list = await askForList(llm, CREATOR_SYSTEM, buildNuggetCreatePrompt(topic.narrative, context, opts.maxNuggets, nuggets), 3000);
+    if (!list) continue; // a failed pass just means this batch contributes nothing
+    const merged = [...new Set(list.map((s) => s.trim()).filter((s) => s.length > 0))];
+    if (merged.length >= nuggets.length) nuggets = merged.slice(0, opts.maxNuggets);
+  }
+  return nuggets;
 }
 
 /** Keep only the nuggets the scorer calls vital — the V/V_strict metrics ignore the rest. */

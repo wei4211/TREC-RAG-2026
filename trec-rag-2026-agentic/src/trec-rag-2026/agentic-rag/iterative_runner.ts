@@ -9,7 +9,7 @@ import { buildAnswerGenerationPrompt, buildCompactAnswerGenerationPrompt, buildC
 import { verifyCitations } from "./citation_verify";
 import { denseScores } from "../retrieval/dense_rerank";
 import { reattributeCitations } from "./citation_reattribute";
-import { predictNuggets, selectVitalNuggets, findNuggetGaps } from "./nugget_loop";
+import { predictNuggets, findNuggetGaps } from "./nugget_loop";
 import { AGENTIC_RAG_BASELINE_PROMPT_VERSION, type AgenticRagBaselineConfig, type AgenticRagOutputObject, type TopicIdentity } from "../agentic-rag-baseline/contracts";
 import { normalizeRagOutputObjectReferences, validateRagOutputObjectStrict } from "../agentic-rag-baseline/validation";
 import { buildExtractiveFallbackAnswerDraft, type AgenticRagBaselineReadDoc } from "../agentic-rag-baseline/fallback";
@@ -31,7 +31,7 @@ revise_never_drop:true,
 // prompts, assign the draft against them, and run targeted retrieval for the vital ones still missing.
 // Sized from the dev gold nuggets: 41 vital nuggets per topic at the median (range 23-72), grouped into
 // a median of 8 sub-narratives. Predicting only 30 would under-generate the checklist from the start.
-nugget_loop:true,nugget_max:50,nugget_max_gaps:15,nugget_context_docs:12,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
+nugget_loop:true,nugget_max:50,nugget_max_gaps:15,nugget_context_docs:24,nugget_batch_docs:6,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
 // Variable-k submission (Piika-aligned): per topic keep only the confident docs (ce_calibrated >= tau),
 // clamped to [min,max], instead of padding to a fixed cutoff. Reads the persisted fusion_scores.json.
 function writeVariableKSubmission(out:string,topics:{qid:string}[],runId:string,tau:number,minK:number,maxK:number){
@@ -134,10 +134,12 @@ async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions
   // completely. Partially-supported nuggets count as gaps because V_strict scores them zero.
   if(POLICY.nugget_loop&&sentences.length>0){ try{
     const evidence=[...shared.values()].slice(0,POLICY.nugget_context_docs).map(d=>({docid:d.docid,text:d.text}));
-    const predicted=await predictNuggets(a.llm,a.topic,evidence,{maxNuggets:POLICY.nugget_max,contextChars:POLICY.nugget_context_chars});
-    const vital=await selectVitalNuggets(a.llm,a.topic,predicted);
-    const {gaps,assignments}=await findNuggetGaps(a.llm,a.topic,sentences.map(s=>s.text).join(" "),vital,POLICY.nugget_max_gaps);
-    nuggetTrace={predicted:predicted.length,vital:vital.length,gap_count:gaps.length,gaps,assignments};
+    const predicted=await predictNuggets(a.llm,a.topic,evidence,{maxNuggets:POLICY.nugget_max,contextChars:POLICY.nugget_context_chars,batchSize:POLICY.nugget_batch_docs});
+    // Target every predicted nugget rather than only the ones our scorer calls vital: the dev gold is 74%
+    // vital (925 of 1255), so a filter that discarded ~46% would mostly be discarding real targets, and
+    // the gap budget already caps how much work this can cause.
+    const {gaps,assignments}=await findNuggetGaps(a.llm,a.topic,sentences.map(s=>s.text).join(" "),predicted,POLICY.nugget_max_gaps);
+    nuggetTrace={predicted:predicted.length,gap_count:gaps.length,gaps,assignments};
     for(const gap of gaps){ const r=await answerOneAspect(a,gap,docidText,shared); if(r.sentences.length===0)continue; sentences.push(...r.sentences); groups.push(r.sentences); perAspect.push({aspect:`[nugget] ${gap}`,docs:r.docsUsed,sentences:r.sentences.length}); }
   }catch{} }
   // Budget allocation under the official word limit. The old policy appended aspects in order and cut at
