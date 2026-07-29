@@ -11,6 +11,8 @@ export type AgenticRagOutputMetadata = {
   title: string;
   narrative: string;
   prompt: string;
+  // v0.6.0 required: short description of the submitted system/run.
+  run_desc: string;
   // v0.6.0: participant-defined metadata fields are allowed.
   generator?: string;
   retrieval_depth?: number;

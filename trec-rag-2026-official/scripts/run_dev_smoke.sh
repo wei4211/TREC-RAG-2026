@@ -38,7 +38,7 @@ fi
 
 LLM_MODEL="${LLM_MODEL:-Llama-3.3-70B-Instruct}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-RUN_ID="iterative-agentic-official-smoke-${TS}"
+RUN_ID="iterative-agentic-breadth-smoke-${TS}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/runs/trec-rag-2026/agentic-rag/$RUN_ID}"
 
 echo "RUN_ID=$RUN_ID"

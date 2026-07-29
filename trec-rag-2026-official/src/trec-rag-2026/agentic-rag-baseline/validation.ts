@@ -98,7 +98,12 @@ function collectValidationIssues(
   if (!isRecord(metadata)) {
     issues.push({ code: "INVALID_METADATA", message: "metadata must be an object." });
   } else {
-    requireExactKeys(metadata, ["team_id", "run_id", "type", "narrative_id", "title", "narrative", "prompt", "generator", "retrieval_depth"], "metadata", issues);
+    // v0.6.0 explicitly forbids rejecting a RAG object for extra metadata fields, so only require the
+    // official set to be present rather than demanding an exact key match.
+    requireKeys(metadata, ["team_id", "run_id", "narrative_id", "narrative", "run_desc"], "metadata", issues);
+    if (typeof metadata.run_desc !== "string" || metadata.run_desc.trim() === "") {
+      issues.push({ code: "INVALID_RUN_DESC", message: "metadata.run_desc must be non-empty." });
+    }
     if (typeof metadata.team_id !== "string" || metadata.team_id.trim() === "") {
       issues.push({ code: "INVALID_TEAM_ID", message: "metadata.team_id must be non-empty." });
     }
@@ -198,6 +203,13 @@ function validateReferences(references: unknown[], readDocids: Set<string>, issu
     referenceStrings.push(reference);
   });
   return referenceStrings;
+}
+
+/** Require the listed keys to be present, without forbidding additional fields. */
+function requireKeys(value: Record<string, unknown>, expectedKeys: string[], label: string, issues: ValidationIssue[]): void {
+  for (const key of expectedKeys) {
+    if (!Object.hasOwn(value, key)) issues.push({ code: "MISSING_FIELD", message: `Missing field in ${label}: ${key}` });
+  }
 }
 
 function requireExactKeys(value: Record<string, unknown>, expectedKeys: string[], label: string, issues: ValidationIssue[]): void {

@@ -18,7 +18,14 @@ import { rerankWithCrossEncoder, type RerankCandidate } from "../retrieval/cross
 
 type Topic={qid:string;title:string;narrative:string}; type Hit={docid:string;score:number}; type ReadDoc=AgenticRagBaselineReadDoc; type AnswerDraft={references:string[];answer:Array<{text:string;citations:number[]}>}; type Judge={enough:boolean;missing_aspects:string[];followup_queries:string[]};
 export type IterativeOptions={runId:string;teamId:string;outputDir:string;topicsPath:string;qrelsDir:string;pyseriniBaseUrl:string;pyseriniIndex:string;pyseriniTokenEnv:string;limitTopics?:number;initialDocs:number;docsPerIteration:number;maxDocumentsRead:number;maxIterations:number;documentReadLimit:number;llm:RawLlmClientConfig;force?:boolean;resume?:boolean;env?:NodeJS.ProcessEnv};
-const POLICY={retrieval_policy:"iterative-agentic-anchor-bm25-weighted-rrf-w025-query2doc-fusion-peraspect-official-top5000-varK",output_depth:5000,bm25_anchor_weight:1,followup_query_weight:0.25,rrf_k:60,rerank_depth:100,q2d_enabled:true,q2d_weight:1.0,q2d_query_repeat:5,fusion_dense:true,fusion_bm25_weight:1.0,fusion_ce_weight:1.0,fusion_dense_weight:1.0,fusion_rrf_k:60,comprehensive_answer:true,citation_verify:true,support_threshold:0.4,answer_doc_chars:1600,answer_max_tokens:4096,per_aspect_generation:true,aspect_docs:4,aspect_search_depth:100,aspect_max_tokens:1500,aspect_rounds:3,aspect_target_sentences:5,reflection:true,reflection_max_gaps:2,reattribute:true,reattribute_threshold:0.3,reattribute_max_cites:2,vark_threshold:0.5,vark_min:4,vark_max:15,llm_revise:true,revise_snippet_chars:1200,revise_max_tokens:3000} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
+const POLICY={retrieval_policy:"iterative-agentic-anchor-bm25-weighted-rrf-w025-query2doc-fusion-peraspect-official-top5000-varK-breadthfirst",output_depth:5000,bm25_anchor_weight:1,followup_query_weight:0.25,rrf_k:60,rerank_depth:100,q2d_enabled:true,q2d_weight:1.0,q2d_query_repeat:5,fusion_dense:true,fusion_bm25_weight:1.0,fusion_ce_weight:1.0,fusion_dense_weight:1.0,fusion_rrf_k:60,comprehensive_answer:true,citation_verify:true,support_threshold:0.4,answer_doc_chars:1600,answer_max_tokens:4096,per_aspect_generation:true,aspect_docs:4,aspect_search_depth:100,aspect_max_tokens:1500,aspect_rounds:3,aspect_target_sentences:5,reflection:true,reflection_max_gaps:2,reattribute:true,reattribute_threshold:0.3,reattribute_max_cites:2,vark_threshold:0.5,vark_min:4,vark_max:15,llm_revise:true,revise_snippet_chars:1200,revise_max_tokens:3000,
+// Breadth-first budgeting (coverage rebuild). The metric is recall over vital nuggets, so the 1024-word
+// budget must be SPREAD across every aspect rather than consumed first-come-first-served: the old code
+// appended aspects in order and truncated at 1000 words, silently dropping the last aspects entirely.
+breadth_first:true,max_answer_words:1000,aspect_max:12,aspect_reserve_frac:0.75,
+// Never drop a sentence during grounded revision: under a recall metric, deleting a sentence deletes the
+// nuggets it carried. Revision may reword or re-cite, but the sentence count must not shrink.
+revise_never_drop:true} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
 // Variable-k submission (Piika-aligned): per topic keep only the confident docs (ce_calibrated >= tau),
 // clamped to [min,max], instead of padding to a fixed cutoff. Reads the persisted fusion_scores.json.
 function writeVariableKSubmission(out:string,topics:{qid:string}[],runId:string,tau:number,minK:number,maxK:number){
@@ -107,18 +114,27 @@ async function answerOneAspect(a:{topic:TopicIdentity;o:IterativeOptions;llm:Llm
 }
 async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions;llm:LlmClient;out:string;env:NodeJS.ProcessEnv;summary:any},aspects:string[],shared:Map<string,ReadDoc>):Promise<{references:string[];answer:{text:string;citations:number[]}[];perAspect:any[];docText:Map<string,string>}>{
   const docidText=new Map<string,string>([...shared.values()].map(d=>[d.docid,d.text]));
-  const sentences:{text:string;docids:string[]}[]=[]; const perAspect:any[]=[];
-  for(const aspect of aspects){ const r=await answerOneAspect(a,aspect,docidText,shared); sentences.push(...r.sentences); perAspect.push({aspect,docs:r.docsUsed,sentences:r.sentences.length}); }
+  const sentences:{text:string;docids:string[]}[]=[]; const perAspect:any[]=[]; const groups:{text:string;docids:string[]}[][]=[];
+  for(const aspect of aspects){ const r=await answerOneAspect(a,aspect,docidText,shared); sentences.push(...r.sentences); groups.push(r.sentences); perAspect.push({aspect,docs:r.docsUsed,sentences:r.sentences.length}); }
   // v4-style reflection: find aspects still missing/thin, run extra passes for them.
   if(POLICY.reflection&&sentences.length>0){ try{
     const answerText=sentences.map(s=>s.text).join(" ");
     const rr=await a.llm.generate({messages:[{role:"user",content:buildReflectionPrompt(a.topic,answerText)}],temperature:0,maxTokens:400,responseFormat:"json_object"});
     const j=extractObjectCandidate(rr.text); const gaps:string[]=j?((JSON.parse(j)?.gaps)||[]).map((x:any)=>String(x).trim()).filter((x:string)=>x.length>0).slice(0,POLICY.reflection_max_gaps):[];
-    for(const gap of gaps){ const r=await answerOneAspect(a,gap,docidText,shared); sentences.push(...r.sentences); perAspect.push({aspect:`[reflect] ${gap}`,docs:r.docsUsed,sentences:r.sentences.length}); }
+    for(const gap of gaps){ const r=await answerOneAspect(a,gap,docidText,shared); sentences.push(...r.sentences); groups.push(r.sentences); perAspect.push({aspect:`[reflect] ${gap}`,docs:r.docsUsed,sentences:r.sentences.length}); }
   }catch{} }
-  // Cap to the official 1024-word limit (keep a margin): trim trailing sentences if over budget.
+  // Budget allocation under the official word limit. The old policy appended aspects in order and cut at
+  // the limit, so the last aspects were dropped whole — a direct loss of breadth under a recall metric.
+  // Breadth-first instead takes sentence 1 of every aspect, then sentence 2 of every aspect, and so on,
+  // so each aspect is represented before any aspect gets a second sentence.
+  const wc=(t:string)=>t.split(/\s+/).filter(Boolean).length;
   const capped:{text:string;docids:string[]}[]=[]; let words=0;
-  for(const s of sentences){ const w=s.text.split(/\s+/).filter(Boolean).length; if(words+w>1000&&capped.length>0)break; capped.push(s); words+=w; }
+  if(POLICY.breadth_first&&groups.length>0){
+    const depth=Math.max(...groups.map(g=>g.length));
+    for(let round=0;round<depth;round++)for(const g of groups){ const s=g[round]; if(!s)continue; const w=wc(s.text); if(words+w>POLICY.max_answer_words&&capped.length>0)continue; capped.push(s); words+=w; }
+  } else {
+    for(const s of sentences){ const w=wc(s.text); if(words+w>POLICY.max_answer_words&&capped.length>0)break; capped.push(s); words+=w; }
+  }
   const refs:string[]=[]; const idxOf=new Map<string,number>();
   for(const s of capped)for(const d of s.docids)if(!idxOf.has(d)){idxOf.set(d,refs.length);refs.push(d);}
   const answer=capped.map(s=>({text:s.text,citations:s.docids.map(d=>idxOf.get(d)!).slice(0,3)}));
@@ -142,9 +158,9 @@ async function groundedReviseAnswer(a:{topic:TopicIdentity;llm:LlmClient},draft:
     return{references:newRefs,answer:out.map(s=>({text:s.text,citations:s.docids.map(d=>idx.get(d)!)}))};
   }catch{return null;}
 }
-async function decomposeAspects(a:{topic:TopicIdentity;llm:LlmClient;out:string;env:NodeJS.ProcessEnv;summary:any}):Promise<string[]>{try{const r=await a.llm.generate({messages:[{role:"user",content:buildAspectDecompositionPrompt(a.topic)}],temperature:0,maxTokens:600,responseFormat:"json_object"}); const j=extractObjectCandidate(r.text); if(!j)return []; const parsed=JSON.parse(j); const arr=Array.isArray(parsed?.aspects)?parsed.aspects:[]; return arr.map((x:any)=>String(x).trim()).filter((x:string)=>x.length>0).slice(0,8);}catch{return [];}}
+async function decomposeAspects(a:{topic:TopicIdentity;llm:LlmClient;out:string;env:NodeJS.ProcessEnv;summary:any}):Promise<string[]>{try{const r=await a.llm.generate({messages:[{role:"user",content:buildAspectDecompositionPrompt(a.topic)}],temperature:0,maxTokens:600,responseFormat:"json_object"}); const j=extractObjectCandidate(r.text); if(!j)return []; const parsed=JSON.parse(j); const arr=Array.isArray(parsed?.aspects)?parsed.aspects:[]; return arr.map((x:any)=>String(x).trim()).filter((x:string)=>x.length>0).slice(0,POLICY.aspect_max);}catch{return [];}}
 async function answer(a:{topic:TopicIdentity;o:IterativeOptions;cfg:AgenticRagBaselineConfig;llm:LlmClient;readDocs:Map<string,ReadDoc>;out:string;env:NodeJS.ProcessEnv;summary:any}){
-if(a.env.R_ONLY==="1"){const s=sanitizeAnswerDraft(buildExtractiveFallbackAnswerDraft(a.readDocs)); const full:AgenticRagOutputObject={metadata:{team_id:a.cfg.teamId,run_id:a.cfg.runId,type:"automatic",narrative_id:a.topic.qid,title:"",narrative:a.topic.narrative,prompt:a.cfg.promptVersion,generator:a.llm.model,retrieval_depth:POLICY.output_depth},references:s.references,answer:s.answer}; return normalizeRagOutputObjectReferences(full,{config:a.cfg,topic:a.topic,readDocids:new Set(a.readDocs.keys())}).ragObject;}
+if(a.env.R_ONLY==="1"){const s=sanitizeAnswerDraft(buildExtractiveFallbackAnswerDraft(a.readDocs)); const full:AgenticRagOutputObject={metadata:{team_id:a.cfg.teamId,run_id:a.cfg.runId,type:"automatic",narrative_id:a.topic.qid,title:"",narrative:a.topic.narrative,prompt:a.cfg.promptVersion,run_desc:POLICY.retrieval_policy,generator:a.llm.model,retrieval_depth:POLICY.output_depth},references:s.references,answer:s.answer}; return normalizeRagOutputObjectReferences(full,{config:a.cfg,topic:a.topic,readDocids:new Set(a.readDocs.keys())}).ragObject;}
 let draft:any; const docs=[...a.readDocs.values()];
 // v4-style comprehensive generation: decompose narrative into aspects, then require the answer to cover each. Feed ALL read docs (not just 6). Drives coverage.
 const aspects=(POLICY.comprehensive_answer||POLICY.per_aspect_generation)?await decomposeAspects(a):[];
@@ -158,11 +174,16 @@ let verifyStats:any=null;
 // Re-attribution (CiteFix/VeriCite style): re-point each sentence's citation to the best-supporting
 // reference via BGE-Reranker. Preserves coverage (sentence stays) while fixing support. Falls back to
 // the keyword-overlap verify if re-attribution fails/disabled.
-if(POLICY.llm_revise){try{const rev=await groundedReviseAnswer({topic:a.topic,llm:a.llm},sanitized as any,docText); if(rev&&rev.answer.length>0){sanitized=rev as any; verifyStats={mode:"llm_revise",sentences:rev.answer.length};}}catch{}}
+// Never-drop guard: the model is told to return every sentence, but if it still shrinks the answer we
+// reject the whole revision rather than lose the nuggets those sentences carried. Falls through to
+// re-attribution, which fixes citations without touching sentence count.
+if(POLICY.llm_revise){try{const before=sanitized.answer.length; const rev=await groundedReviseAnswer({topic:a.topic,llm:a.llm},sanitized as any,docText);
+  if(rev&&rev.answer.length>0){ if(POLICY.revise_never_drop&&rev.answer.length<before){ verifyStats={mode:"llm_revise_rejected",before,after:rev.answer.length}; } else { sanitized=rev as any; verifyStats={mode:"llm_revise",sentences:rev.answer.length}; } }}catch{}}
+if(verifyStats&&verifyStats.mode==="llm_revise_rejected")verifyStats=null; // let re-attribution handle it
 if(!verifyStats&&POLICY.reattribute){try{const r=await reattributeCitations(sanitized as any,docText,a.env,{threshold:POLICY.reattribute_threshold,maxCites:POLICY.reattribute_max_cites,snippetChars:1500}); if(r.draft.answer.length>0){sanitized=r.draft as any; verifyStats={mode:"reattribute",...r.stats};}}catch{}}
 if(!verifyStats&&POLICY.citation_verify){const v=verifyCitations(sanitized as any,docText,{supportThreshold:POLICY.support_threshold}); if(v.draft.answer.length>0)sanitized=v.draft as any; else sanitized=sanitizeAnswerDraft(buildExtractiveFallbackAnswerDraft(a.readDocs)); verifyStats={mode:"keyword",...v.stats};}
 writeJson(join(a.out,"topics",`${a.topic.qid}.gen_trace.json`),{topic_id:a.topic.qid,aspects,per_aspect:perAspectTrace,verify:verifyStats});}
-const full:AgenticRagOutputObject={metadata:{team_id:a.cfg.teamId,run_id:a.cfg.runId,type:"automatic",narrative_id:a.topic.qid,title:"",narrative:a.topic.narrative,prompt:a.cfg.promptVersion,generator:a.llm.model,retrieval_depth:POLICY.output_depth},references:sanitized.references,answer:sanitized.answer}; return normalizeRagOutputObjectReferences(full,{config:a.cfg,topic:a.topic,readDocids:new Set(a.readDocs.keys())}).ragObject;}
+const full:AgenticRagOutputObject={metadata:{team_id:a.cfg.teamId,run_id:a.cfg.runId,type:"automatic",narrative_id:a.topic.qid,title:"",narrative:a.topic.narrative,prompt:a.cfg.promptVersion,run_desc:POLICY.retrieval_policy,generator:a.llm.model,retrieval_depth:POLICY.output_depth},references:sanitized.references,answer:sanitized.answer}; return normalizeRagOutputObjectReferences(full,{config:a.cfg,topic:a.topic,readDocids:new Set(a.readDocs.keys())}).ragObject;}
 // The LLM occasionally miscounts and cites a references[] index that doesn't exist
 // (CITATION_OUT_OF_RANGE). Rather than failing the whole topic on a single formatting
 // slip, drop the invalid citation indices and drop any sentence left with none.
