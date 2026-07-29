@@ -106,31 +106,40 @@ async function askForList(llm: LlmClient, system: string, user: string, maxToken
 }
 
 /**
- * Predict the nugget list for this narrative from our own retrieved evidence.
+ * Predict the nugget list for this narrative from our own retrieved evidence, one aspect at a time.
  *
- * The creator prompt is explicitly iterative ("this is an iterative process") and takes the list built
- * so far as input. Running it once over one batch under-generates badly: a single pass over 12 documents
- * yielded 24 nuggets where the dev gold has 41 vital per topic at the median. So feed the documents in
- * batches and carry the accumulated list into each pass, which is how the gold lists were built (their
- * provenance is 1171 post-edit versus 84 original).
+ * The creator prompt consolidates rather than accumulates -- it is told to keep "at most N nuggets (can
+ * be less), keeping only the most vital ones" -- so re-running it over more document batches does not
+ * grow the list. One pass over 12 documents gave 24 nuggets; four batched passes gave 20. Both are far
+ * short of the 41 vital nuggets per topic in the dev gold.
+ *
+ * The gold's own structure shows the way: its nuggets carry a `mapped_sub_narrative`, and a topic has a
+ * median of 8 sub-narratives holding ~5 vital nuggets each. So ask per aspect and take the union -- the
+ * consolidation pressure then applies within an aspect instead of across the whole narrative.
  */
 export async function predictNuggets(
   llm: LlmClient,
   topic: TopicIdentity,
   docs: { docid: string; text: string }[],
-  opts: { maxNuggets: number; contextChars: number; batchSize: number },
+  aspects: string[],
+  opts: { maxNuggets: number; perAspect: number; contextDocs: number; contextChars: number },
 ): Promise<string[]> {
-  let nuggets: string[] = [];
-  for (let start = 0; start < docs.length; start += opts.batchSize) {
-    const batch = docs.slice(start, start + opts.batchSize);
-    if (batch.length === 0) break;
-    const context = batch.map((d, i) => `[${i}] ${d.text.slice(0, opts.contextChars)}`).join("\n\n");
-    const list = await askForList(llm, CREATOR_SYSTEM, buildNuggetCreatePrompt(topic.narrative, context, opts.maxNuggets, nuggets), 3000);
-    if (!list) continue; // a failed pass just means this batch contributes nothing
-    const merged = [...new Set(list.map((s) => s.trim()).filter((s) => s.length > 0))];
-    if (merged.length >= nuggets.length) nuggets = merged.slice(0, opts.maxNuggets);
+  const focuses = aspects.length > 0 ? aspects : [""];
+  const seen = new Map<string, string>(); // normalised text -> first spelling kept
+  for (const focus of focuses) {
+    const context = docs.slice(0, opts.contextDocs).map((d, i) => `[${i}] ${d.text.slice(0, opts.contextChars)}`).join("\n\n");
+    const query = focus ? `${topic.narrative}\n\nFocus only on this sub-question: ${focus}` : topic.narrative;
+    const list = await askForList(llm, CREATOR_SYSTEM, buildNuggetCreatePrompt(query, context, opts.perAspect), 2000);
+    if (!list) continue; // a failed aspect just contributes nothing
+    for (const raw of list) {
+      const text = raw.trim();
+      if (!text) continue;
+      const key = text.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+      if (key && !seen.has(key)) seen.set(key, text);
+    }
+    if (seen.size >= opts.maxNuggets) break;
   }
-  return nuggets;
+  return [...seen.values()].slice(0, opts.maxNuggets);
 }
 
 /** Keep only the nuggets the scorer calls vital — the V/V_strict metrics ignore the rest. */

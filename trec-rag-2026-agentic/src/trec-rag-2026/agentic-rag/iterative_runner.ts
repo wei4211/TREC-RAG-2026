@@ -31,7 +31,7 @@ revise_never_drop:true,
 // prompts, assign the draft against them, and run targeted retrieval for the vital ones still missing.
 // Sized from the dev gold nuggets: 41 vital nuggets per topic at the median (range 23-72), grouped into
 // a median of 8 sub-narratives. Predicting only 30 would under-generate the checklist from the start.
-nugget_loop:true,nugget_max:50,nugget_max_gaps:15,nugget_context_docs:24,nugget_batch_docs:6,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
+nugget_loop:true,nugget_max:50,nugget_per_aspect:6,nugget_max_gaps:15,nugget_context_docs:10,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
 // Variable-k submission (Piika-aligned): per topic keep only the confident docs (ce_calibrated >= tau),
 // clamped to [min,max], instead of padding to a fixed cutoff. Reads the persisted fusion_scores.json.
 function writeVariableKSubmission(out:string,topics:{qid:string}[],runId:string,tau:number,minK:number,maxK:number){
@@ -134,7 +134,7 @@ async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions
   // completely. Partially-supported nuggets count as gaps because V_strict scores them zero.
   if(POLICY.nugget_loop&&sentences.length>0){ try{
     const evidence=[...shared.values()].slice(0,POLICY.nugget_context_docs).map(d=>({docid:d.docid,text:d.text}));
-    const predicted=await predictNuggets(a.llm,a.topic,evidence,{maxNuggets:POLICY.nugget_max,contextChars:POLICY.nugget_context_chars,batchSize:POLICY.nugget_batch_docs});
+    const predicted=await predictNuggets(a.llm,a.topic,evidence,aspects,{maxNuggets:POLICY.nugget_max,perAspect:POLICY.nugget_per_aspect,contextDocs:POLICY.nugget_context_docs,contextChars:POLICY.nugget_context_chars});
     // Target every predicted nugget rather than only the ones our scorer calls vital: the dev gold is 74%
     // vital (925 of 1255), so a filter that discarded ~46% would mostly be discarding real targets, and
     // the gap budget already caps how much work this can cause.
