@@ -29,7 +29,9 @@ breadth_first:true,max_answer_words:1000,aspect_max:12,aspect_reserve_frac:0.75,
 revise_never_drop:true,
 // ⑤ Self-assign gap-fill: predict this narrative's nuggets with the organizers' own AutoNuggetizer
 // prompts, assign the draft against them, and run targeted retrieval for the vital ones still missing.
-nugget_loop:true,nugget_max:30,nugget_max_gaps:8,nugget_context_docs:12,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
+// Sized from the dev gold nuggets: 41 vital nuggets per topic at the median (range 23-72), grouped into
+// a median of 8 sub-narratives. Predicting only 30 would under-generate the checklist from the start.
+nugget_loop:true,nugget_max:50,nugget_max_gaps:15,nugget_context_docs:12,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
 // Variable-k submission (Piika-aligned): per topic keep only the confident docs (ce_calibrated >= tau),
 // clamped to [min,max], instead of padding to a fixed cutoff. Reads the persisted fusion_scores.json.
 function writeVariableKSubmission(out:string,topics:{qid:string}[],runId:string,tau:number,minK:number,maxK:number){
