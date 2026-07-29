@@ -22,7 +22,6 @@ Env vars (all overridable):
 """
 import json, os, sys, time, urllib.request, urllib.parse
 from pathlib import Path
-from openai import OpenAI
 
 LLM_API_KEY = os.environ.get("NCHC_API_KEY", "") or os.environ.get("NCHC_GENAI_API_KEY", "")
 PYSERINI_API_TOKEN = os.environ.get("PYSERINI_API_TOKEN", "")
@@ -132,12 +131,23 @@ def fetch_doc_text(docid, cache):
     except Exception as exc:
         text = ""; print(f"    [WARN] failed to fetch doc {docid}: {exc}")
     cache[docid] = text; return text
+class _Client:
+    """Minimal OpenAI-compatible chat client over urllib (no openai/pydantic dependency)."""
+    def __init__(self, api_key, base_url):
+        self.url = base_url.rstrip("/") + "/chat/completions"
+        self.headers = {"Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}", "x-api-key": api_key}
+
 def call_llm(client, system, user, retries=MAX_RETRIES):
+    payload = {"model": MODEL, "max_tokens": 2048,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    data = json.dumps(payload).encode("utf-8")
     for attempt in range(retries):
         try:
-            resp = client.chat.completions.create(model=MODEL, max_tokens=2048,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-            return resp.choices[0].message.content or ""
+            req = urllib.request.Request(client.url, data=data, headers=client.headers, method="POST")
+            with urllib.request.urlopen(req, timeout=180) as r:
+                body = json.loads(r.read())
+            return body["choices"][0]["message"]["content"] or ""
         except Exception as exc:
             wait = min(5 * (2 ** attempt), 60)
             print(f"    [RETRY {attempt+1}/{retries}] {exc} (waiting {wait}s)"); time.sleep(wait)
@@ -203,7 +213,7 @@ def main():
             obj = json.loads(line)
             nuggets_by_qid[obj["qid"]] = [n["text"] for n in obj.get("nuggets", []) if n.get("importance") == "vital"]
     rag_outputs = [json.loads(l) for l in open(RAG_OUTPUT_FILE, encoding="utf-8")]
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    client = _Client(LLM_API_KEY, LLM_BASE_URL)
     doc_cache = load_doc_cache(); Path(EVAL_CACHE_DIR).mkdir(parents=True, exist_ok=True)
     report = []
     for i, obj in enumerate(rag_outputs):
