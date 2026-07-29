@@ -4,7 +4,7 @@ Self-contained RAG self-evaluation (nugget coverage + citation support).
 
 Faithful inlining of RAGDoll's NUGGET_ASSIGNER + SUPPORT_EVAL prompts and the
 scoring logic from evaluate_official.py, with ZERO ragdoll import so it runs
-anywhere with just `openai`. Judge = NCHC gpt-oss-120b (the official judge).
+anywhere with only the Python standard library. Judge = NCHC gpt-oss-120b (the official judge).
 This is a SELF-CHECK, not the organizer's evaluation.
 
 Env vars (all overridable):
