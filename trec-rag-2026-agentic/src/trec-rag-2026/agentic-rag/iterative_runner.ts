@@ -9,6 +9,7 @@ import { buildAnswerGenerationPrompt, buildCompactAnswerGenerationPrompt, buildC
 import { verifyCitations } from "./citation_verify";
 import { denseScores } from "../retrieval/dense_rerank";
 import { reattributeCitations } from "./citation_reattribute";
+import { predictNuggets, selectVitalNuggets, findNuggetGaps } from "./nugget_loop";
 import { AGENTIC_RAG_BASELINE_PROMPT_VERSION, type AgenticRagBaselineConfig, type AgenticRagOutputObject, type TopicIdentity } from "../agentic-rag-baseline/contracts";
 import { normalizeRagOutputObjectReferences, validateRagOutputObjectStrict } from "../agentic-rag-baseline/validation";
 import { buildExtractiveFallbackAnswerDraft, type AgenticRagBaselineReadDoc } from "../agentic-rag-baseline/fallback";
@@ -25,7 +26,10 @@ const POLICY={retrieval_policy:"iterative-agentic-anchor-bm25-weighted-rrf-w025-
 breadth_first:true,max_answer_words:1000,aspect_max:12,aspect_reserve_frac:0.75,
 // Never drop a sentence during grounded revision: under a recall metric, deleting a sentence deletes the
 // nuggets it carried. Revision may reword or re-cite, but the sentence count must not shrink.
-revise_never_drop:true} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
+revise_never_drop:true,
+// ⑤ Self-assign gap-fill: predict this narrative's nuggets with the organizers' own AutoNuggetizer
+// prompts, assign the draft against them, and run targeted retrieval for the vital ones still missing.
+nugget_loop:true,nugget_max:30,nugget_max_gaps:8,nugget_context_docs:12,nugget_context_chars:1200} as const; const CUTS=[10,20,50,100,500,1000],NDCG=[10,20,100,1000];
 // Variable-k submission (Piika-aligned): per topic keep only the confident docs (ce_calibrated >= tau),
 // clamped to [min,max], instead of padding to a fixed cutoff. Reads the persisted fusion_scores.json.
 function writeVariableKSubmission(out:string,topics:{qid:string}[],runId:string,tau:number,minK:number,maxK:number){
@@ -112,9 +116,9 @@ async function answerOneAspect(a:{topic:TopicIdentity;o:IterativeOptions;llm:Llm
   }
   return{sentences:out,docsUsed};
 }
-async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions;llm:LlmClient;out:string;env:NodeJS.ProcessEnv;summary:any},aspects:string[],shared:Map<string,ReadDoc>):Promise<{references:string[];answer:{text:string;citations:number[]}[];perAspect:any[];docText:Map<string,string>}>{
+async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions;llm:LlmClient;out:string;env:NodeJS.ProcessEnv;summary:any},aspects:string[],shared:Map<string,ReadDoc>):Promise<{references:string[];answer:{text:string;citations:number[]}[];perAspect:any[];docText:Map<string,string>;nuggets:any}>{
   const docidText=new Map<string,string>([...shared.values()].map(d=>[d.docid,d.text]));
-  const sentences:{text:string;docids:string[]}[]=[]; const perAspect:any[]=[]; const groups:{text:string;docids:string[]}[][]=[];
+  const sentences:{text:string;docids:string[]}[]=[]; const perAspect:any[]=[]; const groups:{text:string;docids:string[]}[][]=[]; let nuggetTrace:any=null;
   for(const aspect of aspects){ const r=await answerOneAspect(a,aspect,docidText,shared); sentences.push(...r.sentences); groups.push(r.sentences); perAspect.push({aspect,docs:r.docsUsed,sentences:r.sentences.length}); }
   // v4-style reflection: find aspects still missing/thin, run extra passes for them.
   if(POLICY.reflection&&sentences.length>0){ try{
@@ -122,6 +126,17 @@ async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions
     const rr=await a.llm.generate({messages:[{role:"user",content:buildReflectionPrompt(a.topic,answerText)}],temperature:0,maxTokens:400,responseFormat:"json_object"});
     const j=extractObjectCandidate(rr.text); const gaps:string[]=j?((JSON.parse(j)?.gaps)||[]).map((x:any)=>String(x).trim()).filter((x:string)=>x.length>0).slice(0,POLICY.reflection_max_gaps):[];
     for(const gap of gaps){ const r=await answerOneAspect(a,gap,docidText,shared); sentences.push(...r.sentences); groups.push(r.sentences); perAspect.push({aspect:`[reflect] ${gap}`,docs:r.docsUsed,sentences:r.sentences.length}); }
+  }catch{} }
+  // ⑤ Self-assign gap-fill: the draft is scored on vital-nugget recall, so assign it against a predicted
+  // nugget list and run one targeted retrieval+generation pass per vital nugget it does not yet state
+  // completely. Partially-supported nuggets count as gaps because V_strict scores them zero.
+  if(POLICY.nugget_loop&&sentences.length>0){ try{
+    const evidence=[...shared.values()].slice(0,POLICY.nugget_context_docs).map(d=>({docid:d.docid,text:d.text}));
+    const predicted=await predictNuggets(a.llm,a.topic,evidence,{maxNuggets:POLICY.nugget_max,contextChars:POLICY.nugget_context_chars});
+    const vital=await selectVitalNuggets(a.llm,a.topic,predicted);
+    const {gaps,assignments}=await findNuggetGaps(a.llm,a.topic,sentences.map(s=>s.text).join(" "),vital,POLICY.nugget_max_gaps);
+    nuggetTrace={predicted:predicted.length,vital:vital.length,gap_count:gaps.length,gaps,assignments};
+    for(const gap of gaps){ const r=await answerOneAspect(a,gap,docidText,shared); if(r.sentences.length===0)continue; sentences.push(...r.sentences); groups.push(r.sentences); perAspect.push({aspect:`[nugget] ${gap}`,docs:r.docsUsed,sentences:r.sentences.length}); }
   }catch{} }
   // Budget allocation under the official word limit. The old policy appended aspects in order and cut at
   // the limit, so the last aspects were dropped whole — a direct loss of breadth under a recall metric.
@@ -138,7 +153,7 @@ async function generatePerAspectAnswer(a:{topic:TopicIdentity;o:IterativeOptions
   const refs:string[]=[]; const idxOf=new Map<string,number>();
   for(const s of capped)for(const d of s.docids)if(!idxOf.has(d)){idxOf.set(d,refs.length);refs.push(d);}
   const answer=capped.map(s=>({text:s.text,citations:s.docids.map(d=>idxOf.get(d)!).slice(0,3)}));
-  return{references:refs,answer,perAspect,docText:docidText};
+  return{references:refs,answer,perAspect,docText:docidText,nuggets:nuggetTrace};
 }
 // ④ LLM grounded revision: one LLM call reads each sentence + its cited docs, rewrites over-claims,
 // weakens/drops unsupported claims, fixes citations. Stronger than BGE relevance for the support metric.
@@ -164,9 +179,9 @@ if(a.env.R_ONLY==="1"){const s=sanitizeAnswerDraft(buildExtractiveFallbackAnswer
 let draft:any; const docs=[...a.readDocs.values()];
 // v4-style comprehensive generation: decompose narrative into aspects, then require the answer to cover each. Feed ALL read docs (not just 6). Drives coverage.
 const aspects=(POLICY.comprehensive_answer||POLICY.per_aspect_generation)?await decomposeAspects(a):[];
-let perAspectTrace:any=null; const extraDocText=new Map<string,string>();
+let perAspectTrace:any=null; let nuggetTrace:any=null; const extraDocText=new Map<string,string>();
 // v4-port: per-aspect generation first. If it yields a usable answer, use it; otherwise fall back to comprehensive single-call, then compact, then extractive.
-if(POLICY.per_aspect_generation&&aspects.length>0){try{const pa=await generatePerAspectAnswer({topic:a.topic,o:a.o,llm:a.llm,out:a.out,env:a.env,summary:a.summary},aspects,a.readDocs); perAspectTrace=pa.perAspect; for(const [k,v] of pa.docText)extraDocText.set(k,v); if(pa.answer.length>=Math.min(3,aspects.length))draft={value:{references:pa.references,answer:pa.answer}};}catch{}}
+if(POLICY.per_aspect_generation&&aspects.length>0){try{const pa=await generatePerAspectAnswer({topic:a.topic,o:a.o,llm:a.llm,out:a.out,env:a.env,summary:a.summary},aspects,a.readDocs); perAspectTrace=pa.perAspect; nuggetTrace=pa.nuggets; for(const [k,v] of pa.docText)extraDocText.set(k,v); if(pa.answer.length>=Math.min(3,aspects.length))draft={value:{references:pa.references,answer:pa.answer}};}catch{}}
 if(!draft){try{const promptDocs=docs.map(d=>({docid:d.docid,text:d.text.slice(0,POLICY.answer_doc_chars)})); draft=await generateJsonWithRetry({client:a.llm,messages:[{role:"user",content:POLICY.comprehensive_answer?buildComprehensiveAnswerPrompt({topic:a.topic,documents:promptDocs,aspects}):buildAnswerGenerationPrompt({topic:a.topic,documents:docs.slice(0,6).map(d=>({docid:d.docid,text:d.text.slice(0,1000)}))})}],temperature:0,maxTokens:POLICY.answer_max_tokens,validate:validateAnswer,stage:"answer_generation",maxRequestRetries:4,onAttempt:(attempt)=>recordAttempt({attempt,stage:"answer_generation",qid:a.topic.qid,out:a.out,env:a.env,summary:a.summary})});}catch{try{draft=await generateJsonWithRetry({client:a.llm,messages:[{role:"user",content:buildCompactAnswerGenerationPrompt({topic:a.topic,documents:docs.slice(0,5).map(d=>({docid:d.docid,text:d.text.slice(0,800)}))})}],temperature:0,maxTokens:2000,validate:validateAnswer,stage:"answer_generation",maxRequestRetries:4,onAttempt:(attempt)=>recordAttempt({attempt,stage:"answer_generation",qid:a.topic.qid,out:a.out,env:a.env,summary:a.summary})});}catch{draft={value:buildExtractiveFallbackAnswerDraft(a.readDocs)}}}} let sanitized=sanitizeAnswerDraft(draft.value); if(sanitized.answer.length===0)sanitized=sanitizeAnswerDraft(buildExtractiveFallbackAnswerDraft(a.readDocs));
 // Grounded citation verification: drop citations whose cited doc does not actually support the sentence. Logs before/after so support gain is attributable.
 {const docText=new Map<string,string>([...a.readDocs.values()].map(d=>[d.docid,d.text])); for(const [k,v] of extraDocText)if(!docText.has(k))docText.set(k,v);
@@ -182,7 +197,7 @@ if(POLICY.llm_revise){try{const before=sanitized.answer.length; const rev=await 
 if(verifyStats&&verifyStats.mode==="llm_revise_rejected")verifyStats=null; // let re-attribution handle it
 if(!verifyStats&&POLICY.reattribute){try{const r=await reattributeCitations(sanitized as any,docText,a.env,{threshold:POLICY.reattribute_threshold,maxCites:POLICY.reattribute_max_cites,snippetChars:1500}); if(r.draft.answer.length>0){sanitized=r.draft as any; verifyStats={mode:"reattribute",...r.stats};}}catch{}}
 if(!verifyStats&&POLICY.citation_verify){const v=verifyCitations(sanitized as any,docText,{supportThreshold:POLICY.support_threshold}); if(v.draft.answer.length>0)sanitized=v.draft as any; else sanitized=sanitizeAnswerDraft(buildExtractiveFallbackAnswerDraft(a.readDocs)); verifyStats={mode:"keyword",...v.stats};}
-writeJson(join(a.out,"topics",`${a.topic.qid}.gen_trace.json`),{topic_id:a.topic.qid,aspects,per_aspect:perAspectTrace,verify:verifyStats});}
+writeJson(join(a.out,"topics",`${a.topic.qid}.gen_trace.json`),{topic_id:a.topic.qid,aspects,per_aspect:perAspectTrace,nuggets:nuggetTrace,verify:verifyStats});}
 const full:AgenticRagOutputObject={metadata:{team_id:a.cfg.teamId,run_id:a.cfg.runId,type:"automatic",narrative_id:a.topic.qid,title:"",narrative:a.topic.narrative,prompt:a.cfg.promptVersion,run_desc:POLICY.retrieval_policy,generator:a.llm.model,retrieval_depth:POLICY.output_depth},references:sanitized.references,answer:sanitized.answer}; return normalizeRagOutputObjectReferences(full,{config:a.cfg,topic:a.topic,readDocids:new Set(a.readDocs.keys())}).ragObject;}
 // The LLM occasionally miscounts and cites a references[] index that doesn't exist
 // (CITATION_OUT_OF_RANGE). Rather than failing the whole topic on a single formatting
