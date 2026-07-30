@@ -202,6 +202,13 @@ if(verifyStats&&verifyStats.mode==="llm_revise_rejected")verifyStats=null; // le
 if(!verifyStats&&POLICY.reattribute){try{const r=await reattributeCitations(sanitized as any,docText,a.env,{threshold:POLICY.reattribute_threshold,maxCites:POLICY.reattribute_max_cites,snippetChars:1500}); if(r.draft.answer.length>0){sanitized=r.draft as any; verifyStats={mode:"reattribute",...r.stats};}}catch{}}
 if(!verifyStats&&POLICY.citation_verify){const v=verifyCitations(sanitized as any,docText,{supportThreshold:POLICY.support_threshold}); if(v.draft.answer.length>0)sanitized=v.draft as any; else sanitized=sanitizeAnswerDraft(buildExtractiveFallbackAnswerDraft(a.readDocs)); verifyStats={mode:"keyword",...v.stats};}
 writeJson(join(a.out,"topics",`${a.topic.qid}.gen_trace.json`),{topic_id:a.topic.qid,aspects,per_aspect:perAspectTrace,nuggets:nuggetTrace,verify:verifyStats});}
+// Final word-limit enforcement. The allocator caps the draft at max_answer_words, but the grounded
+// revision that runs afterwards rewrites sentences to state facts completely and can make them longer --
+// dev22 produced one answer of 1237 words against the official 1024-word ceiling. Re-apply the cap on
+// whatever the verification cascade returned, dropping only trailing sentences.
+{const lim=POLICY.max_answer_words; let words=0; const kept:typeof sanitized.answer=[];
+ for(const s of sanitized.answer){const w=s.text.split(/\s+/).filter(Boolean).length; if(words+w>lim&&kept.length>0)break; kept.push(s); words+=w;}
+ if(kept.length<sanitized.answer.length)sanitized={references:sanitized.references,answer:kept};}
 const full:AgenticRagOutputObject={metadata:{team_id:a.cfg.teamId,run_id:a.cfg.runId,type:"automatic",narrative_id:a.topic.qid,title:"",narrative:a.topic.narrative,prompt:a.cfg.promptVersion,run_desc:POLICY.retrieval_policy,generator:a.llm.model,retrieval_depth:POLICY.output_depth},references:sanitized.references,answer:sanitized.answer}; return normalizeRagOutputObjectReferences(full,{config:a.cfg,topic:a.topic,readDocids:new Set(a.readDocs.keys())}).ragObject;}
 // The LLM occasionally miscounts and cites a references[] index that doesn't exist
 // (CITATION_OUT_OF_RANGE). Rather than failing the whole topic on a single formatting

@@ -170,6 +170,19 @@ function collectValidationIssues(
     });
   }
 
+  // "Every RAG answer must be no more than 1024 words." Checked here so an over-length answer fails
+  // loudly instead of being written out as an invalid submission.
+  if (Array.isArray(answer)) {
+    const words = answer
+      .map((sentence) => (isRecord(sentence) && typeof sentence.text === "string" ? sentence.text : ""))
+      .join(" ")
+      .split(/\s+/)
+      .filter(Boolean).length;
+    if (words > 1024) {
+      issues.push({ code: "ANSWER_TOO_LONG", message: `answer is ${words} words; the limit is 1024.` });
+    }
+  }
+
   if (!options.allowUncitedReferences) {
     referenceStrings.forEach((_reference, index) => {
       if (!citedReferenceIndices.has(index)) {
