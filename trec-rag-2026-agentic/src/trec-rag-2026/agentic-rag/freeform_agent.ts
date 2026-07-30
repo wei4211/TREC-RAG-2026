@@ -70,11 +70,16 @@ async function search(o: FreeformOptions, query: string, hits: number, env: Node
     try { r = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {} }); }
     catch { if (attempt === 6) return []; await sleep(600 * 2 ** attempt); continue; }
     if (r.ok) {
-      const v = (await r.json()) as any;
-      return (v.candidates ?? [])
-        .filter((c: any) => typeof c.docid === "string")
-        .slice(0, hits)
-        .map((c: any) => ({ docid: c.docid, score: Number(c.score) || 0, snippet: docText(c.doc).slice(0, POLICY.snippet_chars) }));
+      // The connection can also drop mid-body (undici's "terminated") after headers already came back
+      // ok, so parsing must be retried too -- not just the initial fetch. This is what actually failed
+      // topic 161 in the dev22 run: r.ok was true but .json() threw, uncaught, killing the whole topic.
+      try {
+        const v = (await r.json()) as any;
+        return (v.candidates ?? [])
+          .filter((c: any) => typeof c.docid === "string")
+          .slice(0, hits)
+          .map((c: any) => ({ docid: c.docid, score: Number(c.score) || 0, snippet: docText(c.doc).slice(0, POLICY.snippet_chars) }));
+      } catch { if (attempt === 6) return []; await sleep(600 * 2 ** attempt); continue; }
     }
     if (![429, 500, 502, 503, 504].includes(r.status)) return [];
     await sleep(600 * 2 ** attempt);
@@ -90,7 +95,10 @@ async function readDoc(o: FreeformOptions, docid: string, env: NodeJS.ProcessEnv
     try { r = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {} }); }
     catch { if (attempt === 6) return null; await sleep(600 * 2 ** attempt); continue; }
     if (r.status === 404) return null;
-    if (r.ok) return docText(((await r.json()) as any).doc);
+    if (r.ok) {
+      try { return docText(((await r.json()) as any).doc); }
+      catch { if (attempt === 6) return null; await sleep(600 * 2 ** attempt); continue; }
+    }
     if (![429, 500, 502, 503, 504].includes(r.status)) return null;
     await sleep(r.status === 429 ? Math.min(30000, 2000 * 2 ** attempt) : 600 * 2 ** attempt);
   }
@@ -307,16 +315,25 @@ export async function runFreeformAgenticRag(o: FreeformOptions) {
   let failed = 0;
 
   for (const [i, topic] of topics.entries()) {
-    try {
-      const r = await runTopic({ topic, o, llm, env });
+    // A whole topic can still hit an unexpected exception this code doesn't specifically retry (topic
+    // 161 in the first dev22 run: a mid-body connection drop uncaught in readDoc's .json() parse, now
+    // fixed at the source -- but as a backstop, one transient failure shouldn't cost an entire topic
+    // outright when a second attempt is cheap relative to losing 1/22 of the run).
+    let r: Awaited<ReturnType<typeof runTopic>> | null = null;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 2 && !r; attempt++) {
+      try { r = await runTopic({ topic, o, llm, env }); }
+      catch (e) { lastError = e; if (attempt === 1) { console.error(`    [RETRY] ${topic.qid} topic-level failure: ${e instanceof Error ? e.message : String(e)}`); await sleep(2000); } }
+    }
+    if (r) {
       writeFileSync(join(out, "topics", `${topic.qid}.agent_trace.json`), JSON.stringify({ topic_id: topic.qid, steps: r.steps, queries: r.queries, decided_to_answer: r.decidedToAnswer, documents_read: r.readCount, answer_failure: r.answerFailure }, null, 2));
       if (r.answerFailure) console.error(`    [WARN] ${topic.qid}: answer generation fell back to extractive sentences after ${r.answerFailure.attempts} attempt(s)`);
       rags.push(r.ragObject);
       for (const e of r.ranking) runLines.push(`${topic.qid} Q0 ${e.docid} ${e.rank} ${e.score.toFixed(8)} ${o.runId}`);
       console.error(`${i + 1}/${topics.length} ${topic.qid} steps=${r.steps.length} read=${r.readCount} sentences=${r.ragObject.answer.length} ${r.decidedToAnswer ? "self-stopped" : "budget-stopped"}`);
-    } catch (e) {
+    } else {
       failed++;
-      console.error(`${i + 1}/${topics.length} ${topic.qid} FAILED ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`${i + 1}/${topics.length} ${topic.qid} FAILED ${lastError instanceof Error ? lastError.message : String(lastError)}`);
     }
   }
 
