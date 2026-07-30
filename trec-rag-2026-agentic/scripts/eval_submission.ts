@@ -135,14 +135,14 @@ function main() {
   // What fixed depths over the same pool would have given, as the comparison the variable-depth rule invites.
   if (pool.size > 0) {
     console.log("\n=== 對照:同一排序改用固定深度 ===");
-    console.log("深度".padEnd(10) + "P@k".padStart(8) + "R@k".padStart(8) + "nDCG@k".padStart(9));
+    console.log("深度".padEnd(10) + "P@k".padStart(8) + "R@k".padStart(8) + "nDCG@k".padStart(9) + "未判定率".padStart(10));
     for (const depth of FIXED_DEPTHS) {
       const acc = qrelsPaths.map((p) => {
         const qrels = readQrels(p);
         const rows = qids.map((qid) => scoreAtDepth(pool.get(qid) ?? [], qrels.get(qid) ?? new Map(), depth));
-        return { precision: mean(rows.map((r) => r.precision)), recall: mean(rows.map((r) => r.recall)), ndcg: mean(rows.map((r) => r.ndcg)) };
+        return { precision: mean(rows.map((r) => r.precision)), recall: mean(rows.map((r) => r.recall)), ndcg: mean(rows.map((r) => r.ndcg)), unjudged: mean(rows.map((r) => r.unjudgedRate)) };
       });
-      console.log(`top-${depth}`.padEnd(10) + mean(acc.map((a) => a.precision)).toFixed(4).padStart(8) + mean(acc.map((a) => a.recall)).toFixed(4).padStart(8) + mean(acc.map((a) => a.ndcg)).toFixed(4).padStart(9));
+      console.log(`top-${depth}`.padEnd(10) + mean(acc.map((a) => a.precision)).toFixed(4).padStart(8) + mean(acc.map((a) => a.recall)).toFixed(4).padStart(8) + mean(acc.map((a) => a.ndcg)).toFixed(4).padStart(9) + (mean(acc.map((a) => a.unjudged)) * 100).toFixed(1).padStart(9) + "%");
     }
   }
 
