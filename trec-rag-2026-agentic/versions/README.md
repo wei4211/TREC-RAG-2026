@@ -35,10 +35,13 @@ B1/B2 之間的差異都在雜訊範圍內(合理 —— 這兩版只改生成�
 
 ⚠️ **這份表格評的是完整的重排候選池(`runfile.trec`),不是實際會提交的檔案。**
 2026 官方採「變深度」規則(每題自訂 k、不得補滿固定深度),真正要交的是
-`submission_variable_k.trec`。用 `scripts/eval_submission.ts` 對 B2 的提交檔實測:
+`submission_variable_k.trec`。用 `scripts/eval_submission.ts` 對提交檔實測:
 
 | | P@k | R@k | nDCG@k | 未判定率 |
 |---|---|---|---|---|
+| 學姊 baseline | 不適用 —— 這版沒有變深度提交,`submission_variable_k.trec` 不存在 | | | |
+| A | 尚未評估(`eval_submission.ts` 只對 B2 跑過,A/B1 的結果在 server 上待補跑) | | | |
+| B1 | 同上,待補跑 | | | |
 | **B2 變深度提交(平均 k≈12.5)** | 0.892 | 0.0168 | 0.752 | 3.1% |
 | 對照:同排序改固定 top-10 | 0.897 | 0.0136 | 0.753 | — |
 | 對照:同排序改固定 top-15 | 0.877 | 0.0199 | 0.743 | — |
