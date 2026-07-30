@@ -47,6 +47,20 @@ type Step = { n: number; action: string; detail: string; observation: string; ok
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// The action loop and the final answer call llm.generate() directly rather than through
+// generateJsonWithRetry, because their expected shapes don't fit that helper's validate/JSON-repair
+// contract. But that means a transient connection drop (e.g. undici's "terminated" on a mid-request
+// close, the exact bug fixed in llm/create.ts's classifyProviderError) has no retry here: an action-step
+// failure silently burns one of the fixed step budget, and a failure on the final answer call falls
+// straight through to the crude fallback. Retry a few times before giving either up.
+async function generateWithRetry(llm: LlmClient, options: Parameters<LlmClient["generate"]>[0], attempts = 3): Promise<Awaited<ReturnType<LlmClient["generate"]>> | null> {
+  for (let i = 1; i <= attempts; i++) {
+    try { return await llm.generate(options); }
+    catch { if (i < attempts) await sleep(500 * 2 ** (i - 1)); }
+  }
+  return null;
+}
+
 // ── Corpus access ────────────────────────────────────────────────────────────
 async function search(o: FreeformOptions, query: string, hits: number, env: NodeJS.ProcessEnv): Promise<Hit[]> {
   const token = env[o.pyseriniTokenEnv]?.trim();
@@ -169,13 +183,11 @@ async function runTopic(a: { topic: { qid: string; narrative: string }; o: Freef
   for (let n = 1; n <= POLICY.max_steps; n++) {
     const budget = { steps: POLICY.max_steps - n + 1, reads: POLICY.max_reads - readDocs.size };
     let action: any = null;
-    try {
-      const r = await a.llm.generate({
-        messages: [{ role: "user", content: actionPrompt(a.topic.narrative, steps, known, new Set(readDocs.keys()), budget) }],
-        temperature: 0, maxTokens: POLICY.step_max_tokens, responseFormat: "json_object",
-      });
-      action = extractObject(r.text);
-    } catch { /* fall through to the malformed-action branch */ }
+    const r = await generateWithRetry(a.llm, {
+      messages: [{ role: "user", content: actionPrompt(a.topic.narrative, steps, known, new Set(readDocs.keys()), budget) }],
+      temperature: 0, maxTokens: POLICY.step_max_tokens, responseFormat: "json_object",
+    });
+    if (r) action = extractObject(r.text);
 
     if (!action || typeof action.action !== "string") {
       steps.push({ n, action: "invalid", detail: "", observation: "Could not parse an action. Reply with exactly one JSON action object.", ok: false });
@@ -216,8 +228,8 @@ async function runTopic(a: { topic: { qid: string; narrative: string }; o: Freef
   const docs = [...readDocs.entries()].map(([docid, text]) => ({ docid, text: text.slice(0, 2000) }));
   let sentences: { text: string; docids: string[] }[] = [];
   if (docs.length > 0) {
-    try {
-      const r = await a.llm.generate({ messages: [{ role: "user", content: answerPrompt(a.topic.narrative, docs) }], temperature: 0, maxTokens: POLICY.answer_max_tokens, responseFormat: "json_object" });
+    const r = await generateWithRetry(a.llm, { messages: [{ role: "user", content: answerPrompt(a.topic.narrative, docs) }], temperature: 0, maxTokens: POLICY.answer_max_tokens, responseFormat: "json_object" }, 4);
+    if (r) {
       const parsed = extractObject(r.text);
       const arr: any[] = Array.isArray(parsed?.answer) ? parsed.answer : [];
       let words = 0;
@@ -230,7 +242,7 @@ async function runTopic(a: { topic: { qid: string; narrative: string }; o: Freef
         sentences.push({ text: s.text.trim(), docids });
         words += w;
       }
-    } catch { /* leave sentences empty; the fallback below handles it */ }
+    }
   }
   // A topic must still produce a valid object, so fall back to the first read documents.
   if (sentences.length === 0 && docs.length > 0) {
