@@ -7,8 +7,9 @@
 |---|---|---|
 | `A-official/` | `version-A-official` | 官方對齊:Llama-3.3-70B、Top-5000 候選池、變深度提交、④LLM 改寫、v0.6.0 metadata |
 | `B1-breadth/` | `version-B1-breadth` | + 廣度輪流分配預算、面向 8-12、一句一事實短句、禁止刪句、`run_desc` |
-| `B2-nugget-loop/` | `version-B2-nugget-loop` | + 完整度優先(15-25 字)、自評補洞迴圈(迭代式 nugget 預測 → 批改 → 定向補洞) |
-| (主資料夾) | `version-C-freeform-agent` | + Route B:自由 tool-calling agent(`freeform_agent.ts`) |
+| `B2-nugget-loop/` | `version-B2-nugget-loop` | + 完整度優先(15-25 字)、自評補洞迴圈(逐面向 nugget 預測 → 批改 → 定向補洞)、字數上限事後複查 |
+| `B3-enumerative/` | `version-B3-enumerative` | + 列舉式寫法(25-40 字,把每個維度都點名),取代「一句一事實」 |
+| (主資料夾) | `version-C-freeform-agent` | Route B:自由 tool-calling agent(`freeform_agent.ts`) |
 
 ## dev22 實測
 
@@ -18,7 +19,12 @@
 | A | 0.7475 | 21.9% | 16.0% | 83.1% | 70.3% |
 | B1 | 0.7515 | 26.1% | 16.7% | 93.0% | 90.5% |
 | **B2** | **0.7526** | **34.2%** | **25.6%** | 92.7% | 89.5% |
+| B3 | 跑測中 | | | | |
 | Route B | 未跑 | | | | |
+
+參照點:同一批 nuggets 下,本專案早期的 Python 版 v4 拿到 寬 60.9% / 嚴 54.2%,
+但 hard 支持只有 46.2%,答案僅 540 字 18.6 句(句長 31.9 字)。TS 線至今最高是
+B2 的 25.6%,所以 v4 仍是要追上的目標 —— B3 就是為此而改。
 
 主指標是 strict vital coverage(只有「完整陳述」才計分,partial 算 0)。
 B2 的答案 22 題全部在 1024 字上限內,數字可直接引用。
@@ -48,6 +54,12 @@ B1   廣度輪流分配 + 一句一事實
      support 只從 16.0%→16.7%),句子 9.6 字太短講不完整
 B2   完整度優先(15-25 字)+ 自評補洞迴圈
  ↓   結果:strict 涵蓋 16.7% → 25.6%(+8.9pp),支持守在 ~90%
+     診斷:跟早期 Python v4 對照才發現方向錯了 —— gold nugget 是主題性短句,
+     沒有數字專名,而且成家族出現(business interests affect 付薪/媒體權/管理;
+     X inclusion is a challenge 之於 種族/性別/階級/性向/身障)。一句列舉式
+     的話可涵蓋整個家族,而「一句一事實」把每句的上限鎖在 1 條
+B3   列舉式寫法:把每個被點名的維度都寫出來
+ ↓
 C    Route B:改由模型自己決定控制流程,作為架構對照
 ```
 
