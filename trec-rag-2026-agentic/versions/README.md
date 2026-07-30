@@ -9,7 +9,9 @@
 | `B1-breadth/` | `version-B1-breadth` | + 廣度輪流分配預算、面向 8-12、一句一事實短句、禁止刪句、`run_desc` |
 | `B2-nugget-loop/` | `version-B2-nugget-loop` | + 完整度優先(15-25 字)、自評補洞迴圈(逐面向 nugget 預測 → 批改 → 定向補洞)、字數上限事後複查 |
 | `B3-enumerative/` | `version-B3-enumerative` | + 列舉式寫法(25-40 字,把每個維度都點名),取代「一句一事實」 |
-| (主資料夾) | `version-C-freeform-agent` | Route B:自由 tool-calling agent(`freeform_agent.ts`) |
+| `C-freeform-agent/` | `version-C-freeform-agent` | Route B:自由 tool-calling agent(`freeform_agent.ts`),架構對照組,非 A→B 線的延伸 |
+
+主資料夾(`src/`、`scripts/`,上一層)永遠等於最新 commit,和 `C-freeform-agent/` 內容相同 —— Route B 目前就是最新版。
 
 ## dev22 實測
 
