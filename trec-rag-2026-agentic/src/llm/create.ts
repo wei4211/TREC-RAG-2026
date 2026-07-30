@@ -234,7 +234,13 @@ function classifyProviderError(error: unknown): string {
   if (/empty assistant message/i.test(message)) return "LLM_EMPTY_ASSISTANT_MESSAGE";
   if (/HTTP\s+429/.test(message)) return "LLM_RATE_LIMIT";
   if (/HTTP\s+5\d\d/.test(message)) return "LLM_SERVER_ERROR";
-  if (/fetch failed|network|timeout|timed out|ECONNRESET|ETIMEDOUT/i.test(message)) return "LLM_TRANSIENT_REQUEST_FAILED";
+  // "terminated" is undici's literal error message when the server or a proxy closes the connection
+  // mid-request (a premature-close socket error) -- it does not contain the word "network" or "timeout",
+  // so it fell through to LLM_PROVIDER_FAILED and aborted the whole topic on the first blip with zero
+  // retries. A topic that makes many sequential LLM calls (per-aspect generation, reflection, the nugget
+  // loop, grounded revision) has many chances to hit one transient close, so this got more likely to
+  // fire as call counts grew, not because any particular version is broken.
+  if (/fetch failed|network|timeout|timed out|ECONNRESET|ETIMEDOUT|terminated|socket hang up|other side closed|EPIPE|ECONNREFUSED/i.test(message)) return "LLM_TRANSIENT_REQUEST_FAILED";
   return "LLM_PROVIDER_FAILED";
 }
 
