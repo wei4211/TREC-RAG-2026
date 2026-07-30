@@ -50,10 +50,18 @@ function readQrels(path: string): Qrels {
   return out;
 }
 
-/** Linear-gain nDCG over the first `k` entries, against the ideal ranking of that topic's judged docs. */
+/**
+ * Linear-gain nDCG over the first `k` entries.
+ *
+ * The ideal ranking must be truncated to the same number of positions actually scored, not to `k`. With
+ * k = Infinity (score the whole submission) an ideal truncated at `k` would span every judged document --
+ * hundreds per topic here -- so a 15-row submission was being divided by the IDCG of a 900-row ideal and
+ * came out at 0.05 instead of ~0.75.
+ */
 function ndcgAt(docids: string[], judged: Map<string, number>, k: number): number {
-  const dcg = docids.slice(0, k).reduce((sum, docid, i) => sum + (judged.get(docid) ?? 0) / Math.log2(i + 2), 0);
-  const ideal = [...judged.values()].filter((r) => r > 0).sort((a, b) => b - a).slice(0, k);
+  const depth = Math.min(k, docids.length);
+  const dcg = docids.slice(0, depth).reduce((sum, docid, i) => sum + (judged.get(docid) ?? 0) / Math.log2(i + 2), 0);
+  const ideal = [...judged.values()].filter((r) => r > 0).sort((a, b) => b - a).slice(0, depth);
   const idcg = ideal.reduce((sum, rel, i) => sum + rel / Math.log2(i + 2), 0);
   return idcg > 0 ? dcg / idcg : 0;
 }
