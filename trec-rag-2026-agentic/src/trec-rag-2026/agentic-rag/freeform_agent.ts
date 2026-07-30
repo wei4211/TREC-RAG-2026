@@ -225,23 +225,42 @@ async function runTopic(a: { topic: { qid: string; narrative: string }; o: Freef
   }
 
   // Final answer over everything the agent chose to read.
+  // responseFormat is a no-op here: the NCHC client (llm/nchc_llm.ts) never forwards it to the API (a
+  // gpt-oss compatibility workaround), so JSON compliance depends entirely on the model reading the
+  // prompt instructions. There is no server-side enforcement, and this call carries a lot of document
+  // context (up to 6 docs at 2000 chars), so give the model a genuine second attempt with a correction
+  // message on a parse failure -- exactly what generateJsonWithRetry does elsewhere -- instead of a
+  // single try that falls straight through to the crude fallback. Keep the raw text on failure so a bad
+  // run is diagnosable instead of silently degrading into fallback sentences.
   const docs = [...readDocs.entries()].map(([docid, text]) => ({ docid, text: text.slice(0, 2000) }));
   let sentences: { text: string; docids: string[] }[] = [];
+  let answerFailure: { attempts: number; lastRawText: string } | null = null;
   if (docs.length > 0) {
-    const r = await generateWithRetry(a.llm, { messages: [{ role: "user", content: answerPrompt(a.topic.narrative, docs) }], temperature: 0, maxTokens: POLICY.answer_max_tokens, responseFormat: "json_object" }, 4);
-    if (r) {
+    const basePrompt = answerPrompt(a.topic.narrative, docs);
+    let messages: { role: "user" | "assistant"; content: string }[] = [{ role: "user", content: basePrompt }];
+    for (let attempt = 1; attempt <= 3 && sentences.length === 0; attempt++) {
+      const r = await generateWithRetry(a.llm, { messages, temperature: 0, maxTokens: POLICY.answer_max_tokens, responseFormat: "json_object" }, 3);
+      if (!r) { answerFailure = { attempts: attempt, lastRawText: "(no response — request failed after retries)" }; break; }
       const parsed = extractObject(r.text);
       const arr: any[] = Array.isArray(parsed?.answer) ? parsed.answer : [];
       let words = 0;
+      const collected: { text: string; docids: string[] }[] = [];
       for (const s of arr) {
         if (typeof s?.text !== "string" || !s.text.trim()) continue;
         const docids = [...new Set((Array.isArray(s.citations) ? s.citations : []).map((c: any) => String(c)).filter((d: string) => readDocs.has(d)))].slice(0, 3) as string[];
         if (docids.length === 0) continue;
         const w = s.text.split(/\s+/).filter(Boolean).length;
-        if (words + w > POLICY.max_answer_words && sentences.length > 0) break;
-        sentences.push({ text: s.text.trim(), docids });
+        if (words + w > POLICY.max_answer_words && collected.length > 0) break;
+        collected.push({ text: s.text.trim(), docids });
         words += w;
       }
+      if (collected.length > 0) { sentences = collected; break; }
+      answerFailure = { attempts: attempt, lastRawText: r.text.slice(0, 2000) };
+      messages = [
+        ...messages,
+        { role: "assistant", content: r.text.slice(0, 4000) },
+        { role: "user", content: 'That response did not contain a valid {"answer":[{"text":"...","citations":["docid"]}]} object with usable citations. Return ONLY that JSON object, nothing else.' },
+      ];
     }
   }
   // A topic must still produce a valid object, so fall back to the first read documents.
@@ -269,7 +288,7 @@ async function runTopic(a: { topic: { qid: string; narrative: string }; o: Freef
   const ranking = [...fused.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0])).slice(0, POLICY.output_depth)
     .map(([docid, score], i) => ({ docid, rank: i + 1, score }));
 
-  return { ragObject, ranking, steps, queries, decidedToAnswer, readCount: readDocs.size };
+  return { ragObject, ranking, steps, queries, decidedToAnswer, readCount: readDocs.size, answerFailure };
 }
 
 // ── Driver ───────────────────────────────────────────────────────────────────
@@ -290,7 +309,8 @@ export async function runFreeformAgenticRag(o: FreeformOptions) {
   for (const [i, topic] of topics.entries()) {
     try {
       const r = await runTopic({ topic, o, llm, env });
-      writeFileSync(join(out, "topics", `${topic.qid}.agent_trace.json`), JSON.stringify({ topic_id: topic.qid, steps: r.steps, queries: r.queries, decided_to_answer: r.decidedToAnswer, documents_read: r.readCount }, null, 2));
+      writeFileSync(join(out, "topics", `${topic.qid}.agent_trace.json`), JSON.stringify({ topic_id: topic.qid, steps: r.steps, queries: r.queries, decided_to_answer: r.decidedToAnswer, documents_read: r.readCount, answer_failure: r.answerFailure }, null, 2));
+      if (r.answerFailure) console.error(`    [WARN] ${topic.qid}: answer generation fell back to extractive sentences after ${r.answerFailure.attempts} attempt(s)`);
       rags.push(r.ragObject);
       for (const e of r.ranking) runLines.push(`${topic.qid} Q0 ${e.docid} ${e.rank} ${e.score.toFixed(8)} ${o.runId}`);
       console.error(`${i + 1}/${topics.length} ${topic.qid} steps=${r.steps.length} read=${r.readCount} sentences=${r.ragObject.answer.length} ${r.decidedToAnswer ? "self-stopped" : "budget-stopped"}`);
