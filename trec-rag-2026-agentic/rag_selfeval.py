@@ -20,7 +20,7 @@ Env vars (all overridable):
   PYSERINI_BASE_URL default: http://api.castorini.uwaterloo.ca
   PYSERINI_INDEX    default: climbmix-400b
 """
-import json, os, sys, time, urllib.request, urllib.parse
+import json, os, sys, time, urllib.request, urllib.parse, urllib.error
 from pathlib import Path
 
 LLM_API_KEY = os.environ.get("NCHC_API_KEY", "") or os.environ.get("NCHC_GENAI_API_KEY", "")
@@ -36,6 +36,8 @@ REPORT_FILE     = os.environ.get("REPORT_FILE", "official-eval-report.json")
 DOC_CACHE_FILE  = os.environ.get("DOC_CACHE_FILE", "eval_doc_cache.json")
 EVAL_CACHE_DIR  = os.environ.get("EVAL_CACHE_DIR", "eval_cache")
 MAX_RETRIES = 6
+DOC_RETRIES = int(os.environ.get("DOC_RETRIES", "6"))
+DOC_SLEEP = float(os.environ.get("DOC_SLEEP", "0.25"))  # pace doc fetches to stay under the rate limit
 
 # ── inlined RAGDoll prompts ──────────────────────────────────────────────────
 NUGGET_ASSIGNER_SYSTEM = ("You are NuggetizeAssignerLLM, an intelligent assistant that can label a list of "
@@ -121,16 +123,36 @@ def save_doc_cache(cache):
     Path(DOC_CACHE_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(DOC_CACHE_FILE, "w", encoding="utf-8") as f: json.dump(cache, f, ensure_ascii=False)
 def fetch_doc_text(docid, cache):
-    if docid in cache: return cache[docid]
+    """Fetch a document, retrying through rate limits.
+
+    A failure is NOT cached: caching an empty string would make the miss permanent, and a document
+    with empty text silently becomes an unjudgeable sentence, which quietly biases the support metric.
+    """
+    if cache.get(docid): return cache[docid]
     url = f"{PYSERINI_BASE_URL}/v1/{PYSERINI_INDEX}/doc/{urllib.parse.quote(docid)}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {PYSERINI_API_TOKEN}"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r: data = json.loads(r.read())
-        doc = data.get("doc", "")
-        text = (doc.get("text") or doc.get("contents") or json.dumps(doc)) if isinstance(doc, dict) else str(doc)
-    except Exception as exc:
-        text = ""; print(f"    [WARN] failed to fetch doc {docid}: {exc}")
-    cache[docid] = text; return text
+    for attempt in range(DOC_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r: data = json.loads(r.read())
+            doc = data.get("doc", "")
+            text = (doc.get("text") or doc.get("contents") or json.dumps(doc)) if isinstance(doc, dict) else str(doc)
+            if text:
+                cache[docid] = text
+                time.sleep(DOC_SLEEP)
+                return text
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                print(f"    [WARN] doc not found: {docid}")
+                return ""
+            wait = min(60, 5 * (2 ** attempt))
+            print(f"    [RETRY doc {attempt+1}/{DOC_RETRIES}] {docid} HTTP {exc.code} (waiting {wait}s)")
+            time.sleep(wait)
+        except Exception as exc:
+            wait = min(60, 5 * (2 ** attempt))
+            print(f"    [RETRY doc {attempt+1}/{DOC_RETRIES}] {docid} {exc} (waiting {wait}s)")
+            time.sleep(wait)
+    print(f"    [WARN] giving up on doc {docid} after {DOC_RETRIES} attempts")
+    return ""
 class _Client:
     """Minimal OpenAI-compatible chat client over urllib (no openai/pydantic dependency)."""
     def __init__(self, api_key, base_url):
@@ -247,7 +269,12 @@ def main():
         entry = {"narrative_id": qid, "num_vital_nuggets": len(vital),
                  "nugget_assignments": list(zip(vital, assignments)), "nugget_scores": nscore,
                  "num_sentences": len(answer), "support_scores": sscore}
-        json.dump(entry, open(cache_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        # Only cache a topic whose every cited document was judged. Caching a topic scored while some
+        # documents were unfetchable would freeze a biased support number in place.
+        if sscore["num_missing"] == 0:
+            json.dump(entry, open(cache_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        else:
+            print(f"    [NOT CACHED] {sscore['num_missing']} sentence(s) unjudged; topic {qid} will be retried")
         report.append(entry); time.sleep(0.3)
     Path(REPORT_FILE).parent.mkdir(parents=True, exist_ok=True)
     json.dump(report, open(REPORT_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
